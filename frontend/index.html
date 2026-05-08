@@ -1,0 +1,742 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>MarketWatch — NSE/BSE Tracker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
+  <style>
+    :root {
+      --bg: #0A0C10;
+      --surface: #111318;
+      --surface2: #181B22;
+      --border: #1E2230;
+      --border2: #252B3B;
+      --accent: #3B7FFF;
+      --accent2: #1E4FCC;
+      --green: #00C48C;
+      --red: #FF4757;
+      --amber: #FFB836;
+      --text: #E8EAF0;
+      --muted: #6B7280;
+      --muted2: #9CA3AF;
+      --mono: 'DM Mono', monospace;
+      --sans: 'DM Sans', sans-serif;
+      --display: 'Syne', sans-serif;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+    /* Grid background */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(59,127,255,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(59,127,255,0.03) 1px, transparent 1px);
+      background-size: 40px 40px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* â”€â”€ HEADER â”€â”€ */
+    header {
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(10,12,16,0.92);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 32px;
+      height: 60px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .logo {
+      font-family: var(--display);
+      font-size: 18px; font-weight: 800; letter-spacing: -0.5px;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .logo-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 10px var(--accent);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.6;transform:scale(0.85)} }
+    .header-right { display: flex; align-items: center; gap: 12px; }
+    .badge {
+      font-family: var(--mono);
+      font-size: 11px; padding: 3px 10px;
+      border-radius: 4px;
+      background: rgba(59,127,255,0.1);
+      border: 1px solid rgba(59,127,255,0.2);
+      color: var(--accent);
+    }
+
+    /* â”€â”€ MAIN LAYOUT â”€â”€ */
+    main { position: relative; z-index: 1; padding: 28px 32px; max-width: 1600px; margin: 0 auto; }
+
+    /* â”€â”€ CONTROL PANEL â”€â”€ */
+    .control-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 24px;
+    }
+    .control-top {
+      display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap;
+    }
+    .field-group { display: flex; flex-direction: column; gap: 6px; }
+    .field-group label {
+      font-family: var(--mono);
+      font-size: 11px; letter-spacing: 0.08em;
+      color: var(--muted); text-transform: uppercase;
+    }
+    .field-group input[type="date"] {
+      background: var(--surface2);
+      border: 1px solid var(--border2);
+      border-radius: 8px;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      padding: 10px 14px;
+      outline: none;
+      transition: border-color 0.2s;
+      color-scheme: dark;
+    }
+    .field-group input[type="date"]:focus { border-color: var(--accent); }
+    .btn-fetch {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-family: var(--display);
+      font-size: 14px; font-weight: 600;
+      padding: 10px 28px;
+      cursor: pointer;
+      transition: all 0.2s;
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+    }
+    .btn-fetch:hover { background: #5591FF; transform: translateY(-1px); }
+    .btn-fetch:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .btn-download {
+      background: transparent;
+      color: var(--green);
+      border: 1px solid var(--green);
+      border-radius: 8px;
+      font-family: var(--display);
+      font-size: 13px; font-weight: 600;
+      padding: 10px 22px;
+      cursor: pointer;
+      transition: all 0.2s;
+      white-space: nowrap;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .btn-download:hover { background: rgba(0,196,140,0.1); }
+    .btn-download:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    /* â”€â”€ PROGRESS â”€â”€ */
+    .progress-wrap {
+      margin-top: 16px;
+      display: none;
+    }
+    .progress-wrap.visible { display: block; }
+    .progress-bar-bg {
+      height: 3px; background: var(--border2);
+      border-radius: 2px; overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--green));
+      border-radius: 2px;
+      transition: width 0.4s ease;
+    }
+    .progress-msg {
+      font-family: var(--mono);
+      font-size: 12px; color: var(--muted2);
+      margin-top: 8px;
+    }
+
+    /* â”€â”€ STAT CARDS â”€â”€ */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px 20px;
+    }
+    .stat-label {
+      font-family: var(--mono);
+      font-size: 10px; letter-spacing: 0.1em;
+      color: var(--muted); text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    .stat-value {
+      font-family: var(--display);
+      font-size: 32px; font-weight: 700;
+      line-height: 1;
+    }
+    .stat-value.blue  { color: var(--accent); }
+    .stat-value.green { color: var(--green); }
+    .stat-value.amber { color: var(--amber); }
+    .stat-value.muted { color: var(--muted2); }
+
+    /* â”€â”€ TABS â”€â”€ */
+    .tabs {
+      display: flex; gap: 4px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px 10px 0 0;
+      padding: 8px 8px 0;
+      border-bottom: none;
+    }
+    .tab-btn {
+      font-family: var(--display);
+      font-size: 13px; font-weight: 600;
+      padding: 9px 22px;
+      border-radius: 7px 7px 0 0;
+      border: none;
+      cursor: pointer;
+      transition: all 0.2s;
+      letter-spacing: 0.02em;
+    }
+    .tab-btn.active {
+      background: var(--surface2);
+      color: var(--text);
+      border-bottom: 2px solid var(--accent);
+    }
+    .tab-btn:not(.active) {
+      background: transparent;
+      color: var(--muted);
+    }
+    .tab-btn:not(.active):hover { color: var(--text); }
+
+    /* â”€â”€ FILTER BAR â”€â”€ */
+    .filter-bar {
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-top: none;
+      padding: 12px 16px;
+    }
+    .search-input {
+      background: var(--surface2);
+      border: 1px solid var(--border2);
+      border-radius: 6px;
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 13px;
+      padding: 8px 14px;
+      outline: none;
+      min-width: 240px;
+      transition: border-color 0.2s;
+    }
+    .search-input:focus { border-color: var(--accent); }
+    .search-input::placeholder { color: var(--muted); }
+    .filter-select {
+      background: var(--surface2);
+      border: 1px solid var(--border2);
+      border-radius: 6px;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 8px 12px;
+      outline: none;
+      cursor: pointer;
+    }
+    .count-badge {
+      margin-left: auto;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    /* â”€â”€ TABLE â”€â”€ */
+    .table-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-top: none;
+      border-radius: 0 0 12px 12px;
+      overflow: auto;
+      max-height: 600px;
+    }
+    table {
+      width: 100%; border-collapse: collapse;
+      font-size: 12px;
+    }
+    thead th {
+      position: sticky; top: 0; z-index: 10;
+      background: var(--surface2);
+      padding: 10px 12px;
+      text-align: left;
+      font-family: var(--mono);
+      font-size: 10px; letter-spacing: 0.08em;
+      color: var(--muted); text-transform: uppercase;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+      cursor: pointer; user-select: none;
+    }
+    thead th:hover { color: var(--text); }
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      transition: background 0.15s;
+    }
+    tbody tr:hover { background: rgba(59,127,255,0.04); }
+    tbody tr:last-child { border-bottom: none; }
+    td {
+      padding: 10px 12px;
+      vertical-align: top;
+      color: var(--text);
+      max-width: 220px;
+    }
+    .td-company { font-weight: 500; color: var(--text); }
+    .td-exchange {
+      font-family: var(--mono);
+      font-size: 10px; font-weight: 500;
+      padding: 2px 7px; border-radius: 3px;
+      display: inline-block;
+    }
+    .td-exchange.NSE { background: rgba(0,196,140,0.12); color: var(--green); }
+    .td-exchange.BSE { background: rgba(255,184,54,0.12); color: var(--amber); }
+    .td-subject { color: var(--muted2); font-size: 11px; line-height: 1.5; }
+    .td-mono { font-family: var(--mono); font-size: 11px; }
+    .td-link a {
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 10px;
+      text-decoration: none;
+      padding: 3px 8px;
+      border: 1px solid rgba(59,127,255,0.3);
+      border-radius: 4px;
+    }
+    .td-link a:hover { background: rgba(59,127,255,0.1); }
+    .action-pill {
+      font-family: var(--mono);
+      font-size: 10px; font-weight: 500;
+      padding: 3px 10px; border-radius: 20px;
+      display: inline-block; white-space: nowrap;
+    }
+    .action-BUY, .action-ACCUMULATE { background: rgba(0,196,140,0.15); color: var(--green); }
+    .action-AVOID { background: rgba(255,71,87,0.15); color: var(--red); }
+    .action-WATCH, .action-NEUTRAL { background: rgba(255,184,54,0.15); color: var(--amber); }
+    .remark { font-size: 11px; line-height: 1.5; color: var(--muted2); max-width: 200px; }
+    .remark.positive { color: rgba(0,196,140,0.9); }
+    .remark.negative { color: rgba(255,71,87,0.8); }
+
+    /* â”€â”€ EMPTY STATE â”€â”€ */
+    .empty-state {
+      text-align: center;
+      padding: 80px 24px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-top: none;
+      border-radius: 0 0 12px 12px;
+    }
+    .empty-icon {
+      font-size: 48px; margin-bottom: 16px; opacity: 0.3;
+    }
+    .empty-title {
+      font-family: var(--display);
+      font-size: 18px; font-weight: 600;
+      color: var(--muted2); margin-bottom: 8px;
+    }
+    .empty-sub {
+      font-size: 13px; color: var(--muted);
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: var(--surface); }
+    ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-dot"></div>
+    MarketWatch
+  </div>
+  <div class="header-right">
+    <span class="badge">NSE + BSE</span>
+    <span class="badge" id="api-status">Checking...</span>
+  </div>
+</header>
+
+<main>
+  <!-- Control Panel -->
+  <div class="control-panel">
+    <div class="control-top">
+      <div class="field-group">
+        <label>From Date</label>
+        <input type="date" id="from-date"/>
+      </div>
+      <div class="field-group">
+        <label>To Date</label>
+        <input type="date" id="to-date"/>
+      </div>
+      <button class="btn-fetch" id="btn-fetch" onclick="triggerFetch()">
+        ⚡ Fetch Announcements
+      </button>
+      <button class="btn-download" id="btn-download" disabled onclick="downloadExcel()">
+        ↓ Download Excel
+      </button>
+    </div>
+    <div class="progress-wrap" id="progress-wrap">
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="progress-fill" style="width:0%"></div>
+      </div>
+      <div class="progress-msg" id="progress-msg">Starting...</div>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats">
+    <div class="stat-card">
+      <div class="stat-label">Total Fetched</div>
+      <div class="stat-value blue" id="stat-total">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Auth Capital</div>
+      <div class="stat-value green" id="stat-auth">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Other Announcements</div>
+      <div class="stat-value amber" id="stat-other">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">NSE</div>
+      <div class="stat-value muted" id="stat-nse">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">BSE</div>
+      <div class="stat-value muted" id="stat-bse">—</div>
+    </div>
+  </div>
+
+  <!-- Tabs + Table -->
+  <div class="tabs">
+    <button class="tab-btn active" id="tab-auth" onclick="switchTab('auth')">
+      📄ˆ Auth Capital
+    </button>
+    <button class="tab-btn" id="tab-other" onclick="switchTab('other')">
+      📄‹ Other Announcements
+    </button>
+  </div>
+
+  <div class="filter-bar">
+    <input class="search-input" id="search-input" placeholder="Search company or subject..." oninput="applyFilters()"/>
+    <select class="filter-select" id="filter-exchange" onchange="applyFilters()">
+      <option value="">All Exchanges</option>
+      <option value="NSE">NSE</option>
+      <option value="BSE">BSE</option>
+    </select>
+    <select class="filter-select" id="filter-action" onchange="applyFilters()">
+      <option value="">All Actions</option>
+      <option value="BUY">BUY</option>
+      <option value="ACCUMULATE">ACCUMULATE</option>
+      <option value="WATCH">WATCH</option>
+      <option value="NEUTRAL">NEUTRAL</option>
+      <option value="AVOID">AVOID</option>
+    </select>
+    <span class="count-badge" id="row-count"></span>
+  </div>
+
+  <div id="table-container"></div>
+</main>
+
+<script>
+  const API = 'http://localhost:8000';
+  let allData = [];
+  let currentTab = 'auth';
+  let currentFilename = '';
+  let pollTimer = null;
+
+  // Set default dates to today
+  const today = new Date().toISOString().split('T')[0];
+  document.getElementById('from-date').value = today;
+  document.getElementById('to-date').value = today;
+
+  // â”€â”€ Check API health on load â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  async function checkHealth() {
+    try {
+      const r = await fetch(`${API}/health`);
+      const d = await r.json();
+      const el = document.getElementById('api-status');
+      el.textContent = d.api_key_set ? 'ðŸŸ¢ AI Active' : 'ðŸŸ¡ No API Key';
+      el.style.color = d.api_key_set ? 'var(--green)' : 'var(--amber)';
+    } catch {
+      document.getElementById('api-status').textContent = '🔍´ Backend Offline';
+    }
+  }
+
+  // â”€â”€ On page load: if backend already has data, show it immediately â”€â”€â”€â”€â”€â”€â”€â”€
+  async function loadExistingData() {
+    try {
+      const sr = await fetch(`${API}/status`);
+      const sd = await sr.json();
+
+      if (sd.status === 'done') {
+        currentFilename = sd.filename || '';
+        await fetchAndRenderAnnouncements(sd);
+        document.getElementById('btn-download').disabled = !currentFilename;
+        return;
+      }
+
+      if (sd.status === 'running') {
+        // Pipeline still in progress — resume polling
+        document.getElementById('btn-fetch').disabled = true;
+        document.getElementById('progress-wrap').classList.add('visible');
+        pollStatus();
+        return;
+      }
+
+      // idle / error — try to load whatever is in the DB anyway
+      await fetchAndRenderAnnouncements(null);
+    } catch (e) {
+      // Backend offline — just show empty state
+      renderTable();
+    }
+  }
+
+  async function fetchAndRenderAnnouncements(statusPayload) {
+    try {
+      const ar = await fetch(`${API}/announcements`);
+      const ad = await ar.json();
+      allData = ad.data || [];
+    } catch (e) {
+      console.error('Failed to load announcements:', e);
+      allData = [];
+    }
+
+    const authCount  = allData.filter(a => !!a.is_auth_capital).length;
+    const otherCount = allData.filter(a => !a.is_auth_capital).length;
+
+    updateStats(
+      (statusPayload && statusPayload.total  != null) ? statusPayload.total  : allData.length,
+      (statusPayload && statusPayload.auth_count  != null) ? statusPayload.auth_count  : authCount,
+      (statusPayload && statusPayload.other_count != null) ? statusPayload.other_count : otherCount,
+      allData.filter(a => a.exchange === 'NSE').length,
+      allData.filter(a => a.exchange === 'BSE').length
+    );
+    renderTable();
+  }
+
+  checkHealth();
+  loadExistingData();
+
+  // â”€â”€ Fetch trigger â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  async function triggerFetch() {
+    const fromDate = document.getElementById('from-date').value;
+    const toDate   = document.getElementById('to-date').value;
+    if (!fromDate || !toDate) { alert('Please select both dates'); return; }
+
+    // Convert YYYY-MM-DD â†’ DD-MM-YYYY
+    const fmt = d => d.split('-').reverse().join('-');
+
+    document.getElementById('btn-fetch').disabled = true;
+    document.getElementById('btn-download').disabled = true;
+    document.getElementById('progress-wrap').classList.add('visible');
+    document.getElementById('table-container').innerHTML = '';
+    allData = [];
+    updateStats(0, 0, 0, 0, 0);
+
+    try {
+      await fetch(`${API}/fetch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from_date: fmt(fromDate), to_date: fmt(toDate) })
+      });
+      pollStatus();
+    } catch (e) {
+      alert('Cannot connect to backend. Make sure it is running on port 8000.');
+      document.getElementById('btn-fetch').disabled = false;
+    }
+  }
+
+  // â”€â”€ Status poller â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  function pollStatus() {
+    if (pollTimer) clearInterval(pollTimer);
+    let consecutiveIdle = 0;   // guard against brief idle glitch
+
+    pollTimer = setInterval(async () => {
+      try {
+        const r = await fetch(`${API}/status`);
+        const d = await r.json();
+        document.getElementById('progress-fill').style.width = d.progress + '%';
+        document.getElementById('progress-msg').textContent = d.message;
+
+        if (d.status === 'done') {
+          clearInterval(pollTimer);
+          consecutiveIdle = 0;
+          currentFilename = d.filename || '';
+          document.getElementById('btn-fetch').disabled = false;
+          document.getElementById('btn-download').disabled = !currentFilename;
+          document.getElementById('progress-msg').textContent = 'Loading dataâ€¦';
+
+          await fetchAndRenderAnnouncements(d);
+          document.getElementById('progress-wrap').classList.remove('visible');
+
+        } else if (d.status === 'error') {
+          clearInterval(pollTimer);
+          document.getElementById('progress-msg').textContent = 'âŒ Error: ' + d.message;
+          document.getElementById('btn-fetch').disabled = false;
+
+        } else if (d.status === 'idle') {
+          // Only abort if we see idle repeatedly — prevents false-positive on
+          // a single transient read between state transitions.
+          consecutiveIdle++;
+          if (consecutiveIdle >= 3 && document.getElementById('progress-wrap').classList.contains('visible')) {
+            clearInterval(pollTimer);
+            document.getElementById('progress-wrap').classList.remove('visible');
+            document.getElementById('btn-fetch').disabled = false;
+            console.warn('Poll aborted: backend returned idle 3Ã— in a row.');
+          }
+        } else {
+          consecutiveIdle = 0;   // reset counter while running
+        }
+      } catch (err) {
+        console.error('Polling error:', err);
+      }
+    }, 1200);
+  }
+
+  // â”€â”€ Stats + UI helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  function updateStats(total, auth, other, nse, bse) {
+    document.getElementById('stat-total').textContent = total || '—';
+    document.getElementById('stat-auth').textContent  = auth  || '—';
+    document.getElementById('stat-other').textContent = other || '—';
+    document.getElementById('stat-nse').textContent   = nse   || '—';
+    document.getElementById('stat-bse').textContent   = bse   || '—';
+  }
+
+  function switchTab(tab) {
+    currentTab = tab;
+    document.getElementById('tab-auth').classList.toggle('active', tab === 'auth');
+    document.getElementById('tab-other').classList.toggle('active', tab === 'other');
+    document.getElementById('filter-action').value = '';
+    document.getElementById('filter-exchange').value = '';
+    document.getElementById('search-input').value = '';
+    renderTable();
+  }
+
+  function applyFilters() { renderTable(); }
+
+  function getFilteredData() {
+    const isAuth   = currentTab === 'auth';
+    const search   = document.getElementById('search-input').value.toLowerCase();
+    const exchange = document.getElementById('filter-exchange').value;
+    const action   = document.getElementById('filter-action').value.toUpperCase();
+
+    return allData.filter(a => {
+      if (isAuth !== !!a.is_auth_capital) return false;
+      if (search && !a.company?.toLowerCase().includes(search) && !a.subject?.toLowerCase().includes(search)) return false;
+      if (exchange && a.exchange !== exchange) return false;
+      if (action && !a.action?.toUpperCase().includes(action)) return false;
+      return true;
+    });
+  }
+
+  function renderTable() {
+    const rows = getFilteredData();
+    document.getElementById('row-count').textContent = `${rows.length} records`;
+    const container = document.getElementById('table-container');
+
+    if (rows.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">📄­</div>
+          <div class="empty-title">${allData.length === 0 ? 'No data yet' : 'No results found'}</div>
+          <div class="empty-sub">${allData.length === 0 ? 'Select a date range and click Fetch Announcements' : 'Try changing the filters'}</div>
+        </div>`;
+      return;
+    }
+
+    const isAuth = currentTab === 'auth';
+    container.innerHTML = `
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Exchange</th>
+              <th>Company</th>
+              <th>Date</th>
+              ${isAuth ? `
+              <th>Board Approval</th>
+              <th>DOBM</th>
+              <th>Exst Auth Cap</th>
+              <th>New Auth Cap</th>
+              <th>Increase</th>` : ''}
+              <th>CMP</th>
+              <th>MCap (Cr)</th>
+              <th>Sector</th>
+              <th>Subject</th>
+              ${isAuth ? `
+              <th>Remark +</th>
+              <th>Remark âˆ’</th>
+              <th>Action</th>` : ''}
+              <th>Link</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((a, i) => {
+              const stock = a._stock || {};
+              const actionKey = (a.action || '').toUpperCase().split(' ')[0];
+              return `<tr>
+                <td class="td-mono">${i + 1}</td>
+                <td><span class="td-exchange ${a.exchange}">${a.exchange}</span></td>
+                <td class="td-company">${a.company || '—'}</td>
+                <td class="td-mono">${formatDate(a.date)}</td>
+                ${isAuth ? `
+                <td class="td-mono">${a.board_approval || '—'}</td>
+                <td class="td-mono">${a.dobm || '—'}</td>
+                <td class="td-mono">${a.existing_auth_cap || '—'}</td>
+                <td class="td-mono">${a.new_auth_cap || '—'}</td>
+                <td class="td-mono">${a.proposed_increase || '—'}</td>` : ''}
+                <td class="td-mono">${stock.cmp || '—'}</td>
+                <td class="td-mono">${stock.mcap || '—'}</td>
+                <td>${stock.sector || a.sector || '—'}</td>
+                <td class="td-subject">${(a.subject || '').slice(0, 120)}${a.subject?.length > 120 ? 'â€¦' : ''}</td>
+                ${isAuth ? `
+                <td class="remark positive">${a.remark_positive || '—'}</td>
+                <td class="remark negative">${a.remark_negative || '—'}</td>
+                <td><span class="action-pill action-${actionKey}">${a.action || '—'}</span></td>` : ''}
+                <td class="td-link">${a.link ? `<a href="${a.link}" target="_blank">View â†—</a>` : '—'}</td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  }
+
+  function formatDate(raw) {
+    if (!raw) return '—';
+    const d = new Date(raw);
+    if (isNaN(d)) return raw;
+    return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+  }
+
+  function downloadExcel() {
+    if (!currentFilename) return;
+    window.open(`${API}/download/${currentFilename}`, '_blank');
+  }
+
+  // Initial empty state
+  renderTable();
+</script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+.venv
+
+# Database
+backend/announcements.db
+backend/announcements.db-journal
+
+# Scratch files
+backend/scratch/
+fix_mojibake.py
+
+# Excel exports
+backend/*.xlsx
+
+# Frontend
+node_modules/
