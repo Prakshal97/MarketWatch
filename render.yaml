@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: nse-bse-tracker
+    env: python
+    # We set the root directory to backend so Render finds the requirements.txt, 
+    # but our main.py will look for the frontend folder one level up. 
+    # Wait, if we use backend as root, `..` works. 
+    # Alternatively, just use the repo root and point pip to backend/requirements.txt.
+    buildCommand: "pip install -r backend/requirements.txt"
+    startCommand: "uvicorn backend.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.0
+      - key: API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: RENDER
+        value: "true"
+    disk:
+      name: tracker-data
+      mountPath: /data
+      sizeGB: 1

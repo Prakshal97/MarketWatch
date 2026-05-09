@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
@@ -459,7 +459,7 @@
 </main>
 
 <script>
-  const API = 'http://localhost:8000';
+  const API = '';
   let allData = [];
   let currentTab = 'auth';
   let currentFilename = '';
@@ -538,13 +538,16 @@
   checkHealth();
   loadExistingData();
 
-  // â”€â”€ Fetch trigger â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // — Fetch trigger ——————————————————————————————————————————————————————————————————
   async function triggerFetch() {
     const fromDate = document.getElementById('from-date').value;
     const toDate   = document.getElementById('to-date').value;
     if (!fromDate || !toDate) { alert('Please select both dates'); return; }
 
-    // Convert YYYY-MM-DD â†’ DD-MM-YYYY
+    const apiKey = prompt("Enter Admin API Key to fetch announcements:");
+    if (!apiKey) return;
+
+    // Convert YYYY-MM-DD -> DD-MM-YYYY
     const fmt = d => d.split('-').reverse().join('-');
 
     document.getElementById('btn-fetch').disabled = true;
@@ -557,7 +560,10 @@
     try {
       await fetch(`${API}/fetch`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-API-Key': apiKey
+        },
         body: JSON.stringify({ from_date: fmt(fromDate), to_date: fmt(toDate) })
       });
       pollStatus();

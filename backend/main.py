@@ -1,6 +1,7 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.security import APIKeyHeader
 import httpx
 import json
 import os
@@ -25,15 +26,30 @@ app = FastAPI(title="NSE/BSE Announcement Tracker")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-OUTPUT_DIR = "./output"
+
+# Security Setup
+API_KEY = os.getenv("API_KEY", "admin123")
+api_key_header = APIKeyHeader(name="X-API-Key")
+
+def verify_api_key(api_key: str = Security(api_key_header)):
+    if api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+    return api_key
+
+# Storage Setup (Supports Render persistent disks)
+IS_PRODUCTION = os.getenv("RENDER") == "true"
+DATA_DIR = "/data" if IS_PRODUCTION else "."
+
+OUTPUT_DIR = os.path.join(DATA_DIR, "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "announcements.db")
 
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -48,7 +64,6 @@ BSE_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.bseindia.com/",
 }
-DB_PATH = "announcements.db"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -741,7 +756,7 @@ async def get_status():
 
 
 @app.post("/fetch")
-async def trigger_fetch(req: FetchRequest, background_tasks: BackgroundTasks):
+async def trigger_fetch(req: FetchRequest, background_tasks: BackgroundTasks, api_key: str = Depends(verify_api_key)):
     if fetch_status["status"] == "running":
         raise HTTPException(status_code=409, detail="Fetch already in progress")
     today = date.today().strftime("%d-%m-%Y")
@@ -859,3 +874,16 @@ async def get_announcements():
 @app.get("/health")
 async def health():
     return {"status": "ok", "api_key_set": bool(GROQ_API_KEY)}
+
+# Serve Frontend
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIR = os.path.join(os.path.dirname(BASE_DIR), "frontend")
+if not os.path.exists(FRONTEND_DIR):
+    FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
+
+@app.get("/")
+async def serve_frontend():
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"error": "Frontend not found"}
