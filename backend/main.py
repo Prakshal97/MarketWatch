@@ -1,55 +1,47 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, Security
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from fastapi.security import APIKeyHeader
 import httpx
 import json
 import os
 import re
 import asyncio
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from groq import AsyncGroq
-import io
-import pdfplumber
+from groq import Groq as GroqClient
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import sqlite3
+import io
 
-# Load .env file automatically
+try:
+    from pypdf import PdfReader
+    PYPDF_AVAILABLE = True
+except ImportError:
+    try:
+        from PyPDF2 import PdfReader
+        PYPDF_AVAILABLE = True
+    except ImportError:
+        PYPDF_AVAILABLE = False
+        print("WARNING: pypdf not installed. PDF extraction disabled. Run: pip install pypdf")
+
 load_dotenv()
 
 app = FastAPI(title="NSE/BSE Announcement Tracker")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-
-# Security Setup
-API_KEY = os.getenv("API_KEY", "admin123")
-api_key_header = APIKeyHeader(name="X-API-Key")
-
-def verify_api_key(api_key: str = Security(api_key_header)):
-    if api_key != API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API Key")
-    return api_key
-
-# Storage Setup (Supports Render persistent disks)
-IS_PRODUCTION = os.getenv("RENDER") == "true"
-DATA_DIR = "/data" if IS_PRODUCTION else "."
-
-OUTPUT_DIR = os.path.join(DATA_DIR, "output")
+OUTPUT_DIR = "./output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "announcements.db")
 
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -65,118 +57,36 @@ BSE_HEADERS = {
     "Referer": "https://www.bseindia.com/",
 }
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS announcements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            exchange TEXT,
-            company TEXT,
-            symbol TEXT,
-            subject TEXT,
-            date TEXT,
-            link TEXT,
-            is_auth_capital BOOLEAN,
-            board_approval TEXT,
-            dobm TEXT,
-            existing_auth_cap TEXT,
-            new_auth_cap TEXT,
-            proposed_increase TEXT,
-            cmp TEXT,
-            mcap TEXT,
-            sector TEXT,
-            remark_positive TEXT,
-            remark_negative TEXT,
-            action TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(exchange, symbol, date, subject)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def save_to_db(announcements: list):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    for a in announcements:
-        stock = a.get("_stock", {})
-        try:
-            c.execute("""
-                INSERT OR REPLACE INTO announcements (
-                    exchange, company, symbol, subject, date, link,
-                    is_auth_capital, board_approval, dobm,
-                    existing_auth_cap, new_auth_cap, proposed_increase,
-                    cmp, mcap, sector, remark_positive, remark_negative, action
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                a.get("exchange"), a.get("company"), a.get("symbol"), a.get("subject"), a.get("date"), a.get("link"),
-                a.get("is_auth_capital", False), a.get("board_approval", ""), a.get("dobm", ""),
-                a.get("existing_auth_cap", ""), a.get("new_auth_cap", ""), a.get("proposed_increase", ""),
-                stock.get("cmp", ""), stock.get("mcap", ""), stock.get("sector", a.get("sector", "")),
-                a.get("remark_positive", ""), a.get("remark_negative", ""), a.get("action", "NEUTRAL")
-            ))
-        except Exception as e:
-            # Duplicate or other error
-            pass
-    conn.commit()
-    conn.close()
-
-def get_from_db(from_date: str = None, to_date: str = None) -> list:
-    """
-    Fetch announcements from the DB.
-    When from_date/to_date are supplied (DD-MM-YYYY) we filter records whose
-    `created_at` timestamp falls within the last 24 h of the pipeline run so
-    we only return what was just ingested, not all historical records.
-    Falls back to the 500 most-recent rows when no date range is given.
-    """
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-
-    if from_date and to_date:
-        # Parse the DD-MM-YYYY dates the pipeline uses
-        try:
-            dt_from = datetime.strptime(from_date, "%d-%m-%Y")
-            dt_to   = datetime.strptime(to_date,   "%d-%m-%Y")
-            # Include the whole to_date day
-            ts_from = dt_from.strftime("%Y-%m-%d 00:00:00")
-            ts_to   = dt_to.strftime(  "%Y-%m-%d 23:59:59")
-            c.execute(
-                "SELECT * FROM announcements WHERE created_at BETWEEN ? AND ? "
-                "ORDER BY created_at DESC LIMIT 2000",
-                (ts_from, ts_to),
-            )
-        except Exception:
-            # Fallback: most recent 500
-            c.execute("SELECT * FROM announcements ORDER BY created_at DESC LIMIT 500")
-    else:
-        c.execute("SELECT * FROM announcements ORDER BY created_at DESC LIMIT 500")
-
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-
-    # Map DB fields back to _stock dict for frontend compatibility
-    for r in rows:
-        r["_stock"] = {"cmp": r.pop("cmp"), "mcap": r.pop("mcap"), "sector": r.pop("sector")}
-        r["is_auth_capital"] = bool(r["is_auth_capital"])
-    return rows
-
 
 class FetchRequest(BaseModel):
     from_date: Optional[str] = None  # DD-MM-YYYY
     to_date: Optional[str] = None    # DD-MM-YYYY
 
 
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+def safe_str(val) -> str:
+    """Safely convert any value to a plain string for Excel."""
+    if val is None:
+        return ""
+    if isinstance(val, dict):
+        for key in ("LTP", "CurrRate", "lastPrice", "price", "value"):
+            if key in val:
+                return str(val[key])
+        return str(list(val.values())[0]) if val else ""
+    if isinstance(val, (list, tuple)):
+        return str(val[0]) if val else ""
+    return str(val)
+
+
 # ─── NSE FETCHER ─────────────────────────────────────────────────────────────
 
 async def fetch_nse_announcements(from_date: str, to_date: str) -> list:
+    """Fetch NSE announcements for the given date range (DD-MM-YYYY)."""
     announcements = []
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         try:
-            # Warm up session (NSE requires cookie)
+            # NSE requires a session cookie — warm up first
             await client.get("https://www.nseindia.com", headers=NSE_HEADERS)
             url = (
                 f"https://www.nseindia.com/api/corporate-announcements"
@@ -189,478 +99,614 @@ async def fetch_nse_announcements(from_date: str, to_date: str) -> list:
                 for item in items:
                     announcements.append({
                         "exchange": "NSE",
-                        "company": item.get("comp", item.get("symbol", "")),
-                        "symbol": item.get("symbol", ""),
-                        "subject": item.get("subject") or item.get("desc") or item.get("attchmntText") or "",
-                        "date": item.get("an_dt") or item.get("date") or "",
-                        "link": item.get("attchmntFile") or f"https://www.nseindia.com/api/corporate-announcements?symbol={item.get('symbol','')}&an_num={item.get('an_num','')}",
+                        "company":  item.get("comp", item.get("symbol", "")),
+                        "symbol":   item.get("symbol", ""),
+                        "subject":  item.get("subject", item.get("desc", "")),
+                        "date":     item.get("an_dt", item.get("date", "")),
+                        "link": (
+                            f"https://www.nseindia.com/api/corporate-announcements"
+                            f"?symbol={item.get('symbol','')}&an_num={item.get('an_num','')}"
+                        ),
                         "raw": item,
                     })
+            else:
+                print(f"NSE fetch returned HTTP {resp.status_code}")
         except Exception as e:
             print(f"NSE fetch error: {e}")
+
+    print(f"[NSE] Fetched {len(announcements)} announcements")
     return announcements
 
+
+# ─── BSE FETCHER ─────────────────────────────────────────────────────────────
 
 async def fetch_bse_announcements(from_date: str, to_date: str) -> list:
+    """Fetch BSE announcements day-by-day (BSE paginates poorly over ranges)."""
     announcements = []
-    # Convert DD-MM-YYYY → YYYYMMDD for BSE
     try:
-        d_from = datetime.strptime(from_date, "%d-%m-%Y").strftime("%Y%m%d")
-        d_to   = datetime.strptime(to_date,   "%d-%m-%Y").strftime("%Y%m%d")
+        start_dt = datetime.strptime(from_date, "%d-%m-%Y")
+        end_dt   = datetime.strptime(to_date,   "%d-%m-%Y")
     except Exception:
-        d_from = from_date.replace("-", "")
-        d_to   = to_date.replace("-", "")
+        print("BSE: bad date format")
+        return []
 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        try:
-            url = (
-                f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
-                f"?strCat=-1&strPrevDate={d_from}&strScrip=&strSearch=P"
-                f"&strToDate={d_to}&strType=C&subcategory=-1"
-            )
-            resp = await client.get(url, headers=BSE_HEADERS)
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data.get("Table", data if isinstance(data, list) else [])
-                for item in items:
-                    scrip = item.get("SCRIP_CD", "")
-                    announcements.append({
-                        "exchange": "BSE",
-                        "company": item.get("SLONGNAME", item.get("short_name", "")),
-                        "symbol": str(scrip),
-                        "subject": item.get("HEADLINE", item.get("subject", "")),
-                        "date": item.get("NEWS_DT", item.get("date", "")),
-                        "link": f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{item.get('ATTACHMENTNAME', '')}",
-                        "raw": item,
-                    })
-        except Exception as e:
-            print(f"BSE fetch error: {e}")
+        current_dt = start_dt
+        while current_dt <= end_dt:
+            d_str = current_dt.strftime("%Y%m%d")
+            pageno = 1
+            while True:
+                try:
+                    url = (
+                        f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+                        f"?pageno={pageno}&strCat=-1&strPrevDate={d_str}&strScrip=&strSearch=P"
+                        f"&strToDate={d_str}&strType=C&subcategory=-1"
+                    )
+                    resp = await client.get(url, headers=BSE_HEADERS)
+                    if resp.status_code == 200:
+                        data  = resp.json()
+                        items = data.get("Table", data if isinstance(data, list) else [])
+
+                        # ── DEBUG: log raw keys once so we know the exact field names ──
+                        if items and current_dt == start_dt and pageno == 1:
+                            print(f"[BSE DEBUG] Raw keys: {list(items[0].keys())}")
+
+                        if not items:
+                            break
+
+                        for item in items:
+                            scrip = item.get("SCRIP_CD", "")
+                            attach = item.get("ATTACHMENTNAME", "")
+                            announcements.append({
+                                "exchange": "BSE",
+                                "company":  item.get("SLONGNAME", item.get("short_name", "")),
+                                "symbol":   str(scrip),
+                                "subject":  item.get("HEADLINE", item.get("subject", "")),
+                                "date":     item.get("NEWS_DT", item.get("date", "")),
+                                "link": (
+                                    f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{attach}"
+                                    if attach else ""
+                                ),
+                                "raw": item,
+                            })
+                            
+                        if len(items) < 50:
+                            break
+                        pageno += 1
+                    else:
+                        print(f"[BSE] HTTP {resp.status_code} for date {d_str} page {pageno}")
+                        break
+                except Exception as e:
+                    print(f"[BSE] Fetch error for {d_str} page {pageno}: {e}")
+                    break
+
+            current_dt += timedelta(days=1)
+
+    print(f"[BSE] Fetched {len(announcements)} announcements")
     return announcements
 
 
-# ─── STOCK DATA FETCHER ───────────────────────────────────────────────────────
+# ─── STOCK DATA ───────────────────────────────────────────────────────────────
 
-def safe_str(val) -> str:
-    """Safely convert any value to a plain string for Excel."""
-    if val is None:
-        return ""
-    if isinstance(val, dict):
-        # BSE sometimes returns nested dicts like {'LTP': '151.60', ...}
-        # Try common price keys first
-        for key in ("LTP", "CurrRate", "lastPrice", "price", "value"):
-            if key in val:
-                return str(val[key])
-        return str(list(val.values())[0]) if val else ""
-    if isinstance(val, (list, tuple)):
-        return str(val[0]) if val else ""
-    return str(val)
-
-
-async def fetch_stock_data(client: httpx.AsyncClient, symbol: str, exchange: str, semaphore: asyncio.Semaphore) -> dict:
-    """Fetch CMP, MCap, Sector for a given symbol with concurrency limit"""
+async def fetch_stock_data(symbol: str, exchange: str) -> dict:
+    """Fetch CMP, MCap, Sector for a given symbol."""
     result = {"cmp": "", "mcap": "", "sector": ""}
     if not symbol:
         return result
-    
-    async with semaphore:
+
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         try:
             if exchange == "NSE":
-                url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol.upper()}"
+                await client.get("https://www.nseindia.com", headers=NSE_HEADERS)
+                url  = f"https://www.nseindia.com/api/quote-equity?symbol={symbol.upper()}"
                 resp = await client.get(url, headers=NSE_HEADERS)
-                # If we get 401 or 403, try warming up again (rare but possible during batch)
-                if resp.status_code in (401, 403):
-                    await client.get("https://www.nseindia.com", headers=NSE_HEADERS)
-                    resp = await client.get(url, headers=NSE_HEADERS)
-                
                 if resp.status_code == 200:
-                    d = resp.json()
+                    d          = resp.json()
                     price_info = d.get("priceInfo", {})
                     meta       = d.get("metadata", {})
-                    cmp        = safe_str(price_info.get("lastPrice", ""))
-                    # Try proper mcap field
-                    mc_raw = d.get("securityInfo", {}).get("marketCap", "")
+                    mc_raw     = d.get("securityInfo", {}).get("marketCap", "")
                     try:
-                        mcap_str = f"{round(float(safe_str(mc_raw))/1e7, 2)} Cr" if mc_raw else ""
+                        mcap_str = f"{round(float(safe_str(mc_raw)) / 1e7, 2)} Cr" if mc_raw else ""
                     except Exception:
                         mcap_str = safe_str(mc_raw)
                     result = {
-                        "cmp":    cmp,
+                        "cmp":    safe_str(price_info.get("lastPrice", "")),
                         "mcap":   mcap_str,
                         "sector": safe_str(meta.get("industry", "")),
                     }
+
             elif exchange == "BSE":
-                url = (
+                url  = (
                     f"https://api.bseindia.com/BseIndiaAPI/api/getScripHeaderData/w"
                     f"?Debtflag=&scripcode={symbol}&seriesid="
                 )
                 resp = await client.get(url, headers=BSE_HEADERS)
                 if resp.status_code == 200:
                     d = resp.json()
-                    cmp_raw    = d.get("CurrRate", d.get("Curt_Rate", d.get("LTP", "")))
-                    mcap_raw   = d.get("Mktcap",   d.get("MktCap",   ""))
-                    sector_raw = d.get("Indust",   d.get("Industry", ""))
                     result = {
-                        "cmp":    safe_str(cmp_raw),
-                        "mcap":   safe_str(mcap_raw),
-                        "sector": safe_str(sector_raw),
+                        "cmp":    safe_str(d.get("CurrRate", d.get("Curt_Rate", d.get("LTP", "")))),
+                        "mcap":   safe_str(d.get("Mktcap",  d.get("MktCap", ""))),
+                        "sector": safe_str(d.get("Indust",  d.get("Industry", ""))),
                     }
         except Exception as e:
-            print(f"Stock data fetch error for {symbol} ({exchange}): {e}")
+            print(f"[Stock] Fetch error for {symbol} ({exchange}): {e}")
+
     return result
+
+
+# ─── EXCHANGE CATEGORY CHECK ──────────────────────────────────────────────────
+
+# BSE subcategory strings that definitively indicate an auth capital announcement.
+# We use substring matching (not equality) to handle minor API variations.
+BSE_AUTH_SUBCAT_KEYWORDS = [
+    "alteration of capital",
+    "increase in authorised capital",
+    "increase in authorized capital",
+    "sub-division of shares",
+    "subdivision of shares",
+    "capital change",
+]
+
+# NSE sub_type / desc keywords
+NSE_AUTH_SUBTYPE_KEYWORDS = [
+    "capital change",
+    "alteration of capital",
+    "increase in authorised",
+    "increase in authorized",
+]
+
+
+def is_exchange_auth_category(ann: dict) -> bool:
+    """
+    Return True if the exchange itself explicitly tagged this announcement
+    as being about an authorised capital change.
+
+    BSE: checks SUBCATEGORYNAME and SUBCATNAME (both field names observed in the wild).
+    NSE: checks sub_type and desc fields from the raw item.
+    """
+    raw      = ann.get("raw", {})
+    exchange = ann.get("exchange", "")
+
+    if exchange == "BSE":
+        # Try every field name BSE has ever used for this
+        subcat_raw = (
+            raw.get("SUBCATEGORYNAME")
+            or raw.get("SUBCATNAME")
+            or raw.get("SubCategoryName")
+            or raw.get("subcategoryname")
+            or ""
+        )
+        subcat = str(subcat_raw).strip().lower()
+
+        print(f"[BSE CAT] company='{ann.get('company','')}' subcat='{subcat}'")
+
+        return any(kw in subcat for kw in BSE_AUTH_SUBCAT_KEYWORDS)
+
+    elif exchange == "NSE":
+        sub_type = str(raw.get("sub_type", "") or "").strip().lower()
+        desc     = str(raw.get("desc",     "") or "").strip().lower()
+        subject  = str(raw.get("subject",  "") or "").strip().lower()
+
+        combined = f"{sub_type} {desc} {subject}"
+        return any(kw in combined for kw in NSE_AUTH_SUBTYPE_KEYWORDS)
+
+    return False
+
+
+# ─── KEYWORD FILTER ───────────────────────────────────────────────────────────
+
+AUTH_CAPITAL_KEYWORDS = [
+    "authorised capital",
+    "authorized capital",
+    "increase in authorised",
+    "increase in authorized",
+    "alteration of capital clause",
+    "increase of capital clause",
+    "memorandum of association",
+    "moa alteration",
+    "increase in auth",
+    "raising of authorised",
+    "change in authorised capital",
+    "change in authorized capital",
+    "alteration in capital clause",
+    "sub-division",
+    "subdivision",
+    "increase in the authorised",
+    "increase in the authorized",
+]
+
+AUTH_CAPITAL_BLACKLIST = [
+    "outcome of board meeting",
+    "outcome of the board meeting",
+    "board meeting outcome",
+    "financial results",
+    "dividend",
+    "buyback",
+    "merger",
+    "amalgamation",
+    "acquisition",
+    "change in management",
+    "resignation",
+    "appointment",
+    "loss of share certificate",
+    "trading window",
+    "compliances",
+    "credit rating",
+    "press release",
+    "investor presentation",
+    "analyst meet",
+    "agm",
+    "egm",
+    "annual general meeting",
+    "extraordinary general meeting",
+    "allotment of shares",
+    "issue of shares",
+    "debentures",
+    "rights issue",
+    "preferential allotment",
+    "esop",
+    "stock split",
+    "bonus issue",
+]
+
+
+def is_auth_capital_keyword_match(subject: str) -> bool:
+    """Return True only if the subject strongly suggests an auth capital increase."""
+    subj = subject.lower().strip()
+    if any(bl in subj for bl in AUTH_CAPITAL_BLACKLIST):
+        return False
+    return any(kw in subj for kw in AUTH_CAPITAL_KEYWORDS)
 
 
 # ─── AI CLASSIFIER ───────────────────────────────────────────────────────────
 
+def classify_with_ai(announcements: list) -> list:
+    """
+    Classify announcements as auth capital or not.
 
+    Pipeline:
+      1. Exchange category check  → definitive YES from the exchange itself
+      2. Keyword pre-filter       → must have auth capital language in subject
+      3. Groq AI confirmation     → verifies and extracts fields for candidates
+      4. Final gate               → exchange match overrides AI rejection
+    """
 
-
-def extract_capital_fallback(text: str) -> dict:
-    res = {"existing_auth_cap": "", "new_auth_cap": "", "proposed_increase": "", "action": "NEUTRAL", "board_approval": "", "dobm": "", "remark_positive": "", "remark_negative": ""}
-    if not text: return res
-    pattern = r'(?i)from\s+(?:rs\.?|rupees|inr)?\s*([\d,.]+)\s*(?:crores?|lakhs?)?\s*to\s+(?:rs\.?|rupees|inr)?\s*([\d,.]+)'
-    match = re.search(pattern, text)
-    if match:
-        res["existing_auth_cap"] = match.group(1)
-        res["new_auth_cap"] = match.group(2)
-        try:
-            ex = float(match.group(1).replace(",", ""))
-            nw = float(match.group(2).replace(",", ""))
-            if nw > ex:
-                res["proposed_increase"] = str(nw - ex)
-                res["action"] = "BUY on dip"
-        except: pass
-    return res
-
-
-def extract_pdf_text_sync(content: bytes) -> str:
-    text = ""
-    try:
-        with pdfplumber.open(io.BytesIO(content)) as pdf:
-            for i in range(min(5, len(pdf.pages))):
-                page_text = pdf.pages[i].extract_text()
-                if page_text: text += page_text + "\n"
-    except Exception as e:
-        print(f"pdfplumber extraction error: {e}")
-    return text
-
-async def classify_and_extract_async(announcements: list) -> list:
-    """Scan subjects and PDFs, then use Groq to extract auth capital fields."""
-    
-    # Identify candidates based on subject
-    candidates = []
+    # ── Step 1: Pre-classify ──────────────────────────────────────────────────
     for ann in announcements:
-        subj = ann.get("subject", "").lower()
-        if any(kw in subj for kw in ["authori", "capital", "outcome of board meeting", "board meeting", "general meeting", "egm", "agm", "postal ballot", "scrutinizer report", "voting results"]):
-            candidates.append(ann)
-        else:
-            ann["is_auth_capital"] = False
-            ann.update({k: "" for k in ["board_approval", "dobm", "existing_auth_cap", "new_auth_cap", "proposed_increase", "remark_positive", "remark_negative", "action"]})
-            
-    # Fetch PDFs for candidates concurrently
-    semaphore = asyncio.Semaphore(15)
-    async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
-        # Warm up if any NSE candidates
-        if any("nseindia.com" in (a.get("link") or "") for a in candidates):
-            try: await client.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
-            except: pass
+        subj = ann.get("subject", "")
+        ann["_keyword_match"]  = is_auth_capital_keyword_match(subj)
+        ann["_exchange_match"] = is_exchange_auth_category(ann)
 
-        async def fetch_pdf(ann):
-            link = ann.get("link")
-            if not link: return
-            
-            # Use headers but allow PDF content type
-            h = BSE_HEADERS.copy() if "bseindia.com" in link else NSE_HEADERS.copy()
-            h["Accept"] = "application/pdf, */*"
-            
-            # BSE Path Fallback: Try AttachHis then AttachLive
-            links_to_try = [link]
-            if "bseindia.com" in link and "AttachHis" in link:
-                links_to_try.append(link.replace("AttachHis", "AttachLive"))
-            
-            async with semaphore:
-                for target_link in links_to_try:
-                    for attempt in range(3):
-                        try:
-                            r = await client.get(target_link, headers=h, timeout=30)
-                            if r.status_code == 200:
-                                text = await asyncio.to_thread(extract_pdf_text_sync, r.content)
-                                ann["_pdf_text"] = text
-                                return # Success, exit function
-                            elif r.status_code == 404:
-                                break # 404, try next link in links_to_try
-                            else:
-                                print(f"PDF download failed for {ann.get('symbol')} at {target_link}: {r.status_code}")
-                                break # Other status, don't retry, try next link
-                        except Exception as e:
-                            print(f"PDF error for {ann.get('symbol')} at {target_link} (attempt {attempt+1}): {e}")
-                            await asyncio.sleep(2)
-        
-        await asyncio.gather(*(fetch_pdf(a) for a in candidates))
+        ann.setdefault("is_auth_capital",   False)
+        ann.setdefault("board_approval",    "")
+        ann.setdefault("dobm",              "")
+        ann.setdefault("existing_auth_cap", "")
+        ann.setdefault("new_auth_cap",      "")
+        ann.setdefault("proposed_increase", "")
+        ann.setdefault("remark_positive",   "")
+        ann.setdefault("remark_negative",   "")
+        ann.setdefault("action",            "NEUTRAL")
 
-    # Refine candidates based on PDF text
-    deep_targets = []
-    for ann in candidates:
-        subj = ann.get("subject", "").lower()
-        raw_text = ann.get("_pdf_text", "")
-        text = raw_text.lower()
-        # Normalize text to catch spaced-out words like "A u t h o r i s e d"
-        norm = re.sub(r"\s+", "", text)
-        
-        is_candidate = False
-        # If subject explicitly mentions it
-        if any(kw in subj for kw in ["authoris", "authoriz", "auth capital", "alteration of capital"]):
-            is_candidate = True
-        # If PDF text contains both 'authori' AND 'capital' in close proximity or normalized
-        elif ("authori" in text and "capital" in text) or ("authori" in norm and "capital" in norm):
-            # Guard against "authority" false positives if possible, though LLM will filter anyway
-            is_candidate = True
-            
-        if is_candidate:
-            deep_targets.append(ann)
-        else:
-            ann["is_auth_capital"] = False
-            ann.update({k: "" for k in ["board_approval", "dobm", "existing_auth_cap", "new_auth_cap", "proposed_increase", "remark_positive", "remark_negative", "action"]})
+    # ── Step 2: Split into candidates vs non-candidates ───────────────────────
+    candidates     = [a for a in announcements if a["_exchange_match"] or a["_keyword_match"]]
+    non_candidates = [a for a in announcements if not (a["_exchange_match"] or a["_keyword_match"])]
 
-    # Query Groq for deep_targets
-    if not deep_targets or not GROQ_API_KEY:
-        for ann in deep_targets:
-            subj = ann.get("subject", "").lower()
-            text = ann.get("_pdf_text", "").lower()
-            norm = re.sub(r"\s+", "", text)
-            
-            is_auth = False
-            if any(kw in subj for kw in ["authoris", "authoriz", "auth capital", "alteration of capital"]):
-                is_auth = True
-            elif ("authori" in text and "capital" in text) or ("authori" in norm and "capital" in norm):
-                is_auth = True
-                
-            ann["is_auth_capital"] = is_auth
-            fallback_data = extract_capital_fallback(text)
-            ann.update(fallback_data)
+    print(
+        f"[Classify] Exchange-matched: {sum(1 for a in announcements if a['_exchange_match'])} | "
+        f"Keyword-matched: {sum(1 for a in announcements if a['_keyword_match'])} | "
+        f"Total candidates: {len(candidates)} | Skipping: {len(non_candidates)}"
+    )
+
+    for ann in non_candidates:
+        ann["is_auth_capital"] = False
+
+    if not candidates:
         return announcements
-    
-    client = AsyncGroq(api_key=GROQ_API_KEY)
-    SYSTEM_PROMPT = """You are a senior Indian equity market analyst. Extract structural data from the announcement.
-You MUST respond with ONLY a valid JSON object — no explanation, no markdown fences."""
 
-    for ann in deep_targets:
-        text = ann.get("_pdf_text", "")
-        text = text[:4000] # truncate to save tokens
-        
-        user_prompt = f"""Analyze this corporate announcement.
-Subject: {ann.get("subject")}
-PDF Content:
-{text}
+    # ── Step 3: Fallback if no Groq key ──────────────────────────────────────
+    if not GROQ_API_KEY:
+        print("[Classify] No GROQ_API_KEY — using keyword/exchange match only")
+        for ann in candidates:
+            ann["is_auth_capital"] = ann["_exchange_match"] or ann["_keyword_match"]
+            ann["action"] = "WATCH" if ann["is_auth_capital"] else "NEUTRAL"
+        return announcements
 
-Return a JSON object with:
-"is_auth_capital": boolean (true if about increase in Authorised Equity Capital),
-"board_approval": string (DD-MM-YYYY),
-"dobm": string (DD-MM-YYYY),
-"existing_auth_cap": string (e.g. "10,00,00,000"),
-"new_auth_cap": string,
-"proposed_increase": string,
-"remark_positive": string (1 line),
-"remark_negative": string (1 line),
-"action": string ("BUY on dip", "ACCUMULATE", "WATCH", "NEUTRAL", "AVOID")
-
-Reply ONLY with the JSON object."""
-        try:
-            response = await client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.1,
-                max_tokens=1000,
-            )
-            raw = response.choices[0].message.content.strip()
-            raw = re.sub(r"^```json\s*", "", raw)
-            raw = re.sub(r"^```\s*",     "", raw)
-            raw = re.sub(r"\s*```$",     "", raw)
-            res = json.loads(raw)
-            
-            ann.update({
-                "is_auth_capital":   res.get("is_auth_capital",   False),
-                "board_approval":    res.get("board_approval",    ""),
-                "dobm":              res.get("dobm",              ""),
-                "existing_auth_cap": res.get("existing_auth_cap", ""),
-                "new_auth_cap":      res.get("new_auth_cap",      ""),
-                "proposed_increase": res.get("proposed_increase", ""),
-                "remark_positive":   res.get("remark_positive",   ""),
-                "remark_negative":   res.get("remark_negative",   ""),
-                "action":            res.get("action",            "NEUTRAL"),
-            })
-        except Exception as e:
-            print(f"Groq error for {ann.get('symbol')}: {e}")
-            subj = ann.get("subject", "").lower()
-            text = ann.get("_pdf_text", "").lower()
-            norm = re.sub(r"\s+", "", text)
-            
-            is_auth = False
-            if any(kw in subj for kw in ["authoris", "authoriz", "auth capital", "alteration of capital"]):
-                is_auth = True
-            elif ("authori" in text and "capital" in text) or ("authori" in norm and "capital" in norm):
-                is_auth = True
-                
-            ann["is_auth_capital"] = is_auth
-            fallback_data = extract_capital_fallback(text)
-            ann.update(fallback_data)
-
-    return announcements
-
+    # ── Step 4: Groq AI confirmation in batches ───────────────────────────────
     client = GroqClient(api_key=GROQ_API_KEY)
 
-    SYSTEM_PROMPT = """You are a senior Indian equity market analyst.
-You will receive a list of NSE/BSE corporate announcements in JSON.
-Your job is to analyze each one and return structured data.
-You MUST respond with ONLY a valid JSON array — no explanation, no markdown fences, no extra text."""
+    SYSTEM_PROMPT = (
+        "You are a senior Indian equity market analyst specializing in NSE/BSE corporate filings. "
+        "You receive announcements pre-filtered as likely about Increase in Authorised/Authorized Equity Capital. "
+        "Confirm if they truly are and extract structured details. "
+        "Respond ONLY with a valid JSON array — no explanation, no markdown fences, no extra text."
+    )
 
     batch_size = 10
-    skip_groq = False
-    for i in range(0, len(announcements), batch_size):
-        batch = announcements[i:i + batch_size]
-        
-        if skip_groq:
-            # Automatic fallback if rate limit was hit in previous batch
-            for ann in batch:
-                subj = ann.get("subject", "").lower()
-                ann["is_auth_capital"]   = "authoris" in subj or "authoriz" in subj
-                ann.update({k: "" for k in ["board_approval", "dobm", "existing_auth_cap", "new_auth_cap", "proposed_increase", "remark_positive", "remark_negative"]})
-                ann["action"] = "Review" if ann["is_auth_capital"] else "NEUTRAL"
-            continue
+    for i in range(0, len(candidates), batch_size):
+        batch = candidates[i : i + batch_size]
 
-        batch_text = json.dumps([
-            {
-                "idx":     j,
-                "company": a.get("company", ""),
-                "subject": a.get("subject", ""),
-            }
-            for j, a in enumerate(batch)
-        ], indent=2)
+        batch_text = json.dumps(
+            [
+                {"idx": j, "company": a.get("company", ""), "subject": a.get("subject", "")}
+                for j, a in enumerate(batch)
+            ],
+            indent=2,
+        )
 
-        user_prompt = f"""Analyze these corporate announcements and return a JSON array.
+        user_prompt = f"""These announcements have been pre-filtered as LIKELY about Increase in Authorised Equity Capital.
+CONFIRM each one and extract details.
 
-For EACH announcement:
-1. is_auth_capital: true if announcement is about increase in Authorised/Authorized Equity Capital, else false
-2. board_approval: Board approval date in DD-MM-YYYY if found in subject, else ""
-3. dobm: Date of Board Meeting in DD-MM-YYYY if found, else ""
-4. existing_auth_cap: Existing authorised equity capital amount (e.g. "10,00,00,000") if found, else ""
-5. new_auth_cap: New/proposed authorised equity capital amount if found, else ""
-6. proposed_increase: Difference (new - existing) if both found, else ""
-7. remark_positive: 1 line — positive angle (expansion, fundraising flexibility, growth signal). Only if is_auth_capital=true, else ""
-8. remark_negative: 1 line — risk angle (dilution risk, overleveraging). Only if is_auth_capital=true, else ""
-9. action: One of — "BUY on dip", "ACCUMULATE", "WATCH", "NEUTRAL", "AVOID". Only if is_auth_capital=true, else "NEUTRAL"
+CRITICAL RULE: is_auth_capital = true ONLY if the announcement is SPECIFICALLY about:
+- Increase in Authorised/Authorized Share Capital
+- Alteration of Capital Clause in MOA
+- Raising the authorized equity capital limit
+DO NOT mark true for: Board Meeting outcomes, financial results, dividends, share allotments, or any other type.
+
+For EACH announcement extract:
+1. is_auth_capital (bool)
+2. board_approval: Board approval date DD-MM-YYYY or ""
+3. dobm: Date of Board Meeting DD-MM-YYYY or ""
+4. existing_auth_cap: e.g. "10,00,00,000" or ""
+5. new_auth_cap: e.g. "20,00,00,000" or ""
+6. proposed_increase: new minus existing or ""
+7. remark_positive: 1-line positive remark if is_auth_capital=true else ""
+8. remark_negative: 1-line risk remark if is_auth_capital=true else ""
+9. action: "BUY on dip"/"ACCUMULATE"/"WATCH"/"NEUTRAL"/"AVOID" — only if is_auth_capital=true else "NEUTRAL"
 
 Announcements:
 {batch_text}
 
-Reply ONLY with a JSON object containing an "announcements" array, like this:
-{{"announcements": [{{"idx":0,"is_auth_capital":true,"board_approval":"","dobm":"","existing_auth_cap":"","new_auth_cap":"","proposed_increase":"","remark_positive":"","remark_negative":"","action":""}}]}}"""
+Reply ONLY with JSON array:
+[{{"idx":0,"is_auth_capital":true,"board_approval":"","dobm":"","existing_auth_cap":"","new_auth_cap":"","proposed_increase":"","remark_positive":"","remark_negative":"","action":""}}]"""
 
         try:
             response = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="llama-3.3-70b-versatile",
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user",   "content": user_prompt},
                 ],
-                response_format={"type": "json_object"},
-                temperature=0.1,
+                temperature=0.0,
                 max_tokens=3000,
             )
-            raw = response.choices[0].message.content.strip()
-            # Strip accidental markdown fences
-            raw = re.sub(r"^```json\s*", "", raw)
-            raw = re.sub(r"^```\s*",     "", raw)
-            raw = re.sub(r"\s*```$",     "", raw)
+            raw_text = response.choices[0].message.content.strip()
+            raw_text = re.sub(r"^```json\s*", "", raw_text)
+            raw_text = re.sub(r"^```\s*",     "", raw_text)
+            raw_text = re.sub(r"\s*```$",     "", raw_text)
 
-            results = json.loads(raw)
-            if "announcements" in results:
-                results = results["announcements"]
-                
+            results = json.loads(raw_text)
             for r in results:
                 idx = r.get("idx", 0)
-                if idx < len(batch):
-                    batch[idx].update({
-                        "is_auth_capital":   r.get("is_auth_capital",   False),
-                        "board_approval":    r.get("board_approval",    ""),
-                        "dobm":              r.get("dobm",              ""),
-                        "existing_auth_cap": r.get("existing_auth_cap", ""),
-                        "new_auth_cap":      r.get("new_auth_cap",      ""),
-                        "proposed_increase": r.get("proposed_increase", ""),
-                        "remark_positive":   r.get("remark_positive",   ""),
-                        "remark_negative":   r.get("remark_negative",   ""),
-                        "action":            r.get("action",            "NEUTRAL"),
-                    })
+                if idx >= len(batch):
+                    continue
+                ann = batch[idx]
+
+                ai_says_auth = bool(r.get("is_auth_capital", False))
+
+                # ── Final gate ────────────────────────────────────────────────
+                # Exchange match = definitive YES (exchange is source of truth).
+                # Without exchange match, BOTH AI and keyword must agree.
+                if ann["_exchange_match"]:
+                    final_is_auth = True
+                else:
+                    final_is_auth = ai_says_auth and ann["_keyword_match"]
+
+                print(
+                    f"[Classify] '{ann.get('company','')}' | exchange={ann['_exchange_match']} "
+                    f"keyword={ann['_keyword_match']} ai={ai_says_auth} → FINAL={final_is_auth}"
+                )
+
+                ann.update({
+                    "is_auth_capital":   final_is_auth,
+                    "board_approval":    r.get("board_approval",    ""),
+                    "dobm":              r.get("dobm",              ""),
+                    "existing_auth_cap": r.get("existing_auth_cap", ""),
+                    "new_auth_cap":      r.get("new_auth_cap",      ""),
+                    "proposed_increase": r.get("proposed_increase", ""),
+                    "remark_positive":   r.get("remark_positive",   "") if final_is_auth else "",
+                    "remark_negative":   r.get("remark_negative",   "") if final_is_auth else "",
+                    "action":            r.get("action", "NEUTRAL")     if final_is_auth else "NEUTRAL",
+                })
 
         except Exception as e:
-            print(f"Groq classification error (batch {i}): {e}")
-            if "rate_limit_exceeded" in str(e).lower() or "429" in str(e):
-                print("Rate limit reached. Skipping Groq for remaining batches and using keyword fallback.")
-                skip_groq = True
-            
-            # Keyword fallback for this batch
+            print(f"[Classify] Groq error (batch {i}): {e}")
+            # Fallback: trust exchange/keyword match
             for ann in batch:
-                subj = ann.get("subject", "").lower()
-                ann["is_auth_capital"]   = "authoris" in subj or "authoriz" in subj
-                ann.setdefault("board_approval",    "")
-                ann.setdefault("dobm",              "")
-                ann.setdefault("existing_auth_cap", "")
-                ann.setdefault("new_auth_cap",      "")
-                ann.setdefault("proposed_increase", "")
-                ann.setdefault("remark_positive",   "")
-                ann.setdefault("remark_negative",   "")
-                ann.setdefault("action",            "")
+                ann["is_auth_capital"] = ann["_exchange_match"] or ann["_keyword_match"]
+                ann.setdefault("action", "WATCH" if ann["is_auth_capital"] else "NEUTRAL")
 
     return announcements
 
 
+# ─── PDF EXTRACTION ──────────────────────────────────────────────────────────
+
+async def download_pdf_text(url: str, exchange: str) -> str:
+    """Download a PDF and return up to 8 000 chars of extracted text."""
+    if not url or url.strip() in ("", "—"):
+        return ""
+
+    headers = NSE_HEADERS if exchange == "NSE" else BSE_HEADERS
+
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            if exchange == "NSE":
+                await client.get("https://www.nseindia.com", headers=headers)
+
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                print(f"[PDF] Download failed (HTTP {resp.status_code}): {url}")
+                return ""
+
+            content_type = resp.headers.get("content-type", "")
+            if "pdf" not in content_type.lower() and not url.lower().endswith(".pdf"):
+                print(f"[PDF] Not a PDF ({content_type}): {url}")
+                return ""
+
+            if not PYPDF_AVAILABLE:
+                print("[PDF] pypdf not available — skipping")
+                return ""
+
+            reader     = PdfReader(io.BytesIO(resp.content))
+            pages_text = []
+            for page in reader.pages:
+                try:
+                    pages_text.append(page.extract_text() or "")
+                except Exception:
+                    pass
+
+            full_text = "\n".join(pages_text).strip()
+            print(f"[PDF] Extracted {len(full_text)} chars from {url}")
+            return full_text[:8000]
+
+    except Exception as e:
+        print(f"[PDF] Extraction error for {url}: {e}")
+        return ""
+
+
+def extract_fields_from_pdf_text(pdf_text: str, company: str, subject: str) -> dict:
+    """Use Groq to extract auth capital fields from the full PDF text."""
+    empty = {
+        "board_approval": "", "dobm": "",
+        "existing_auth_cap": "", "new_auth_cap": "",
+        "proposed_increase": "", "remark_positive": "",
+        "remark_negative": "", "action": "WATCH",
+    }
+    if not pdf_text or not GROQ_API_KEY:
+        return empty
+
+    client = GroqClient(api_key=GROQ_API_KEY)
+
+    prompt = f"""You are a financial analyst reading an NSE/BSE corporate announcement PDF.
+Company: {company}
+Subject: {subject}
+
+PDF Content:
+{pdf_text}
+
+Extract EXACTLY these fields. Return ONLY a JSON object (no explanation, no markdown):
+{{
+  "board_approval": "DD-MM-YYYY or empty string",
+  "dobm": "DD-MM-YYYY or empty string",
+  "existing_auth_cap": "e.g. 10,00,00,000 or empty string",
+  "new_auth_cap": "e.g. 20,00,00,000 or empty string",
+  "proposed_increase": "new minus existing or empty string",
+  "remark_positive": "1-line positive remark",
+  "remark_negative": "1-line risk remark",
+  "action": "BUY on dip / ACCUMULATE / WATCH / NEUTRAL / AVOID"
+}}"""
+
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=1000,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r"^```json\s*", "", raw)
+        raw = re.sub(r"^```\s*",     "", raw)
+        raw = re.sub(r"\s*```$",     "", raw)
+        result = json.loads(raw)
+        for k in empty:
+            result.setdefault(k, "")
+        return result
+    except Exception as e:
+        print(f"[PDF AI] Field extraction error: {e}")
+        return empty
+
+
+async def enrich_auth_announcements_from_pdf(auth_anns: list) -> list:
+    """Download PDFs and extract fields for all auth capital announcements."""
+    if not auth_anns:
+        return auth_anns
+
+    sem = asyncio.Semaphore(3)
+
+    async def process_one(ann: dict) -> dict:
+        async with sem:
+            url      = ann.get("link", "")
+            exchange = ann.get("exchange", "NSE")
+            company  = ann.get("company", "")
+            subject  = ann.get("subject", "")
+
+            print(f"[PDF] Processing {company}: {url}")
+            pdf_text = await download_pdf_text(url, exchange)
+
+            if pdf_text:
+                loop   = asyncio.get_running_loop()
+                fields = await loop.run_in_executor(
+                    None, extract_fields_from_pdf_text, pdf_text, company, subject
+                )
+                ann["board_approval"]    = fields.get("board_approval",    ann.get("board_approval", ""))
+                ann["dobm"]              = fields.get("dobm",              ann.get("dobm", ""))
+                ann["existing_auth_cap"] = fields.get("existing_auth_cap", ann.get("existing_auth_cap", ""))
+                ann["new_auth_cap"]      = fields.get("new_auth_cap",      ann.get("new_auth_cap", ""))
+                ann["proposed_increase"] = fields.get("proposed_increase", ann.get("proposed_increase", ""))
+                ann["remark_positive"]   = fields.get("remark_positive",   ann.get("remark_positive", ""))
+                ann["remark_negative"]   = fields.get("remark_negative",   ann.get("remark_negative", ""))
+                ann["action"]            = fields.get("action",            ann.get("action", "WATCH"))
+                ann["_pdf_extracted"]    = True
+            else:
+                ann["_pdf_extracted"] = False
+                print(f"[PDF] No text extracted for {company}")
+
+            return ann
+
+    results = await asyncio.gather(*[process_one(a) for a in auth_anns], return_exceptions=True)
+    final   = []
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            print(f"[PDF] Enrichment error for announcement {i}: {r}")
+            final.append(auth_anns[i])
+        else:
+            final.append(r)
+    return final
+
+
 # ─── EXCEL GENERATOR ─────────────────────────────────────────────────────────
 
+COLUMNS = [
+    ("Sr.no",                  8),
+    ("Date of Entry",         13),
+    ("Name of the Company",   28),
+    ("Board Approval",        14),
+    ("DOBM",                  12),
+    ("Exst Auth Eq Cap (INR)",18),
+    ("New Auth Eq Cap (INR)", 18),
+    ("Proposed Increase (INR)",18),
+    ("CMP",                    9),
+    ("M Cap (in Cr)",         13),
+    ("Sector",                18),
+    ("Remark Positive",       28),
+    ("Remark Negative",       28),
+    ("Action",                14),
+    ("Link",                  35),
+]
+
+
 def style_header_cell(cell, bg_color: str, font_color: str = "FFFFFF"):
-    cell.font = Font(bold=True, color=font_color, size=10, name="Calibri")
-    cell.fill = PatternFill("solid", fgColor=bg_color)
+    cell.font      = Font(bold=True, color=font_color, size=10, name="Calibri")
+    cell.fill      = PatternFill("solid", fgColor=bg_color)
     cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    thin = Side(style="thin", color="CCCCCC")
-    cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    thin           = Side(style="thin", color="CCCCCC")
+    cell.border    = Border(left=thin, right=thin, top=thin, bottom=thin)
 
 
 def style_data_cell(cell, wrap=False):
     cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=wrap)
-    thin = Side(style="thin", color="E0E0E0")
-    cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    cell.font = Font(size=9, name="Calibri")
-
-
-COLUMNS = [
-    ("Sr.no",               8),
-    ("Date of Entry",       13),
-    ("Name of the Company", 28),
-    ("Board Approval",      14),
-    ("DOBM",                12),
-    ("Exst Auth Eq Cap (INR)", 18),
-    ("New Auth Eq Cap (INR)",  18),
-    ("Proposed Increase (INR)",18),
-    ("CMP",                  9),
-    ("M Cap (in Cr)",        13),
-    ("Sector",               18),
-    ("Remark Positive",      28),
-    ("Remark Negative",      28),
-    ("Action",               14),
-    ("Link",                 35),
-]
+    thin           = Side(style="thin", color="E0E0E0")
+    cell.border    = Border(left=thin, right=thin, top=thin, bottom=thin)
+    cell.font      = Font(size=9, name="Calibri")
 
 
 def write_sheet(ws, rows: list, header_color: str, title: str):
     # Title row
     ws.merge_cells(f"A1:{get_column_letter(len(COLUMNS))}1")
-    title_cell = ws["A1"]
-    title_cell.value = title
-    title_cell.font = Font(bold=True, size=13, color="FFFFFF", name="Calibri")
-    title_cell.fill = PatternFill("solid", fgColor="1A1A2E")
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    tc = ws["A1"]
+    tc.value     = title
+    tc.font      = Font(bold=True, size=13, color="FFFFFF", name="Calibri")
+    tc.fill      = PatternFill("solid", fgColor="1A1A2E")
+    tc.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 28
 
     # Header row
@@ -676,6 +722,7 @@ def write_sheet(ws, rows: list, header_color: str, title: str):
         stock = ann.get("_stock", {})
         if not isinstance(stock, dict):
             stock = {}
+
         values = [
             row_idx - 2,
             safe_str(ann.get("date", "")),
@@ -693,73 +740,65 @@ def write_sheet(ws, rows: list, header_color: str, title: str):
             safe_str(ann.get("action", "")),
             safe_str(ann.get("link", "")),
         ]
+
         for col_idx, value in enumerate(values, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             style_data_cell(cell, wrap=(col_idx in [3, 12, 13, 15]))
-            # Zebra striping
             if row_idx % 2 == 0:
                 cell.fill = PatternFill("solid", fgColor="F8F9FF")
-            # Color-code action column
             if col_idx == 14 and value:
-                v = str(value).upper()
-                colors = {"BUY": "C6EFCE", "ACCUMULATE": "C6EFCE",
-                          "AVOID": "FFC7CE", "NEUTRAL": "FFEB9C", "WATCH": "FFEB9C"}
+                v      = str(value).upper()
+                colors = {
+                    "BUY":        "C6EFCE",
+                    "ACCUMULATE": "C6EFCE",
+                    "AVOID":      "FFC7CE",
+                    "NEUTRAL":    "FFEB9C",
+                    "WATCH":      "FFEB9C",
+                }
                 for key, clr in colors.items():
                     if key in v:
                         cell.fill = PatternFill("solid", fgColor=clr)
                         break
 
-    # Freeze panes
     ws.freeze_panes = "A3"
 
 
 def generate_excel(auth_anns: list, other_anns: list, date_str: str) -> str:
     wb = openpyxl.Workbook()
 
-    ws_auth = wb.active
+    ws_auth       = wb.active
     ws_auth.title = "Auth Capital"
     write_sheet(ws_auth, auth_anns, "1565C8",
                 f"Authorised Capital Increase Announcements — {date_str}")
 
-    ws_other = wb.create_sheet("Other Announcements")
+    ws_other       = wb.create_sheet("Other Announcements")
     write_sheet(ws_other, other_anns, "C85215",
                 f"Other Announcements — {date_str}")
 
     filename = f"announcements_{date_str.replace(' ', '_').replace('-', '')}.xlsx"
     filepath = os.path.join(OUTPUT_DIR, filename)
     wb.save(filepath)
+    print(f"[Excel] Saved: {filename}")
     return filename
 
 
-# ─── MAIN ENDPOINT ───────────────────────────────────────────────────────────
+# ─── PIPELINE STATUS ──────────────────────────────────────────────────────────
 
-fetch_status = {"status": "idle", "message": "", "progress": 0, "filename": ""}
+fetch_status: dict = {"status": "idle", "message": "", "progress": 0, "filename": ""}
 
-# Store the last fetch date range so /announcements can filter correctly
-_last_fetch_range = {"from_date": None, "to_date": None}
 
+# ─── ENDPOINTS ───────────────────────────────────────────────────────────────
 
 @app.get("/status")
 async def get_status():
-    # Return a lightweight status object — never embed announcements here.
-    # The frontend should call GET /announcements separately once status == 'done'.
-    safe = {
-        "status":      fetch_status.get("status"),
-        "message":     fetch_status.get("message"),
-        "progress":    fetch_status.get("progress"),
-        "filename":    fetch_status.get("filename"),
-        "auth_count":  fetch_status.get("auth_count"),
-        "other_count": fetch_status.get("other_count"),
-        "total":       fetch_status.get("total"),
-    }
-    return safe
+    return fetch_status
 
 
 @app.post("/fetch")
-async def trigger_fetch(req: FetchRequest, background_tasks: BackgroundTasks, api_key: str = Depends(verify_api_key)):
+async def trigger_fetch(req: FetchRequest, background_tasks: BackgroundTasks):
     if fetch_status["status"] == "running":
         raise HTTPException(status_code=409, detail="Fetch already in progress")
-    today = date.today().strftime("%d-%m-%Y")
+    today     = date.today().strftime("%d-%m-%Y")
     from_date = req.from_date or today
     to_date   = req.to_date   or today
     background_tasks.add_task(run_full_pipeline, from_date, to_date)
@@ -767,90 +806,94 @@ async def trigger_fetch(req: FetchRequest, background_tasks: BackgroundTasks, ap
 
 
 async def run_full_pipeline(from_date: str, to_date: str):
-    global _last_fetch_range
-    _last_fetch_range = {"from_date": from_date, "to_date": to_date}
     global fetch_status
     try:
-        fetch_status = {"status": "running", "message": "Fetching NSE announcements...", "progress": 10, "filename": ""}
+        fetch_status = {
+            "status": "running", "message": "Fetching NSE announcements...",
+            "progress": 10, "filename": "",
+        }
 
         nse_anns = await fetch_nse_announcements(from_date, to_date)
-        print(f"NSE fetched: {len(nse_anns)} items")
-        fetch_status["message"] = f"NSE done ({len(nse_anns)} announcements). Fetching BSE..."
-        fetch_status["progress"] = 25
+        fetch_status = {
+            **fetch_status,
+            "message":  f"NSE done ({len(nse_anns)} announcements). Fetching BSE...",
+            "progress": 25,
+        }
 
         bse_anns = await fetch_bse_announcements(from_date, to_date)
-        print(f"BSE fetched: {len(bse_anns)} items")
-        fetch_status["message"] = f"BSE done ({len(bse_anns)} announcements). Running AI classification..."
-        fetch_status["progress"] = 45
+        fetch_status = {
+            **fetch_status,
+            "message":  f"BSE done ({len(bse_anns)} announcements). Running AI classification...",
+            "progress": 45,
+        }
 
         all_anns = nse_anns + bse_anns
-        print(f"Total announcements: {len(all_anns)}")
+        print(f"[Pipeline] Total: {len(all_anns)} (NSE: {len(nse_anns)}, BSE: {len(bse_anns)})")
 
-        # AI Classification (async)
-        all_anns = await classify_and_extract_async(all_anns)
-        fetch_status["message"] = "AI done. Fetching stock prices..."
-        fetch_status["progress"] = 65
+        if not all_anns:
+            fetch_status = {
+                "status": "done",
+                "message": "No announcements found for this date range. Try a different date.",
+                "progress": 100, "filename": "",
+                "auth_count": 0, "other_count": 0, "total": 0, "announcements": [],
+            }
+            return
 
-        # Fetch stock data for each announcement with concurrency control
-        semaphore = asyncio.Semaphore(5)
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            try:
-                # One warm-up for the whole batch
-                fetch_status["message"] = "Warming up NSE session..."
-                await client.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
-            except Exception as e:
-                print(f"NSE Warm-up error: {e}")
-
-            total_stocks = len(all_anns)
-            for idx, ann in enumerate(all_anns):
-                if idx % 10 == 0:
-                    fetch_status["message"] = f"Fetching stock data ({idx}/{total_stocks})..."
-                    # Progress from 45% to 85%
-                    fetch_status["progress"] = 45 + int((idx / total_stocks) * 40)
-                
-                # Fetch stock data one by one (throttled by semaphore anyway)
-                # Actually gather is faster, let's keep gather but with chunks for progress
-                pass
-
-            # Refined gather with progress updates
-            chunk_size = 20
-            for i in range(0, len(all_anns), chunk_size):
-                chunk = all_anns[i:i + chunk_size]
-                fetch_status["message"] = f"Fetching stock data ({i}/{total_stocks})..."
-                fetch_status["progress"] = 45 + int((i / total_stocks) * 40)
-                
-                tasks = [fetch_stock_data(client, a["symbol"], a["exchange"], semaphore) for a in chunk]
-                stock_results = await asyncio.gather(*tasks, return_exceptions=True)
-                for ann, stock in zip(chunk, stock_results):
-                    ann["_stock"] = stock if isinstance(stock, dict) else {}
-
-        fetch_status["message"] = "Generating Excel files..."
-        fetch_status["progress"] = 85
+        loop     = asyncio.get_running_loop()
+        all_anns = await loop.run_in_executor(None, classify_with_ai, all_anns)
 
         auth_anns  = [a for a in all_anns if a.get("is_auth_capital")]
         other_anns = [a for a in all_anns if not a.get("is_auth_capital")]
+        print(f"[Pipeline] Auth capital: {len(auth_anns)}, Other: {len(other_anns)}")
+
+        if auth_anns:
+            fetch_status = {
+                **fetch_status,
+                "message":  f"Classified. Reading PDFs for {len(auth_anns)} auth capital announcements...",
+                "progress": 55,
+            }
+            auth_anns = await enrich_auth_announcements_from_pdf(auth_anns)
+
+        fetch_status = {**fetch_status, "message": "PDF extraction done. Fetching stock prices...", "progress": 70}
+
+        all_anns = auth_anns + other_anns
+
+        sem = asyncio.Semaphore(5)
+
+        async def fetch_with_sem(symbol, exchange):
+            async with sem:
+                return await fetch_stock_data(symbol, exchange)
+
+        stock_results = await asyncio.gather(
+            *[fetch_with_sem(a["symbol"], a["exchange"]) for a in all_anns],
+            return_exceptions=True,
+        )
+        for ann, stock in zip(all_anns, stock_results):
+            ann["_stock"] = stock if isinstance(stock, dict) else {}
+
+        fetch_status = {**fetch_status, "message": "Generating Excel file...", "progress": 88}
 
         date_label = f"{from_date} to {to_date}" if from_date != to_date else from_date
-        loop = asyncio.get_event_loop()
-        filename = await loop.run_in_executor(None, generate_excel, auth_anns, other_anns, date_label)
+        filename   = await loop.run_in_executor(None, generate_excel, auth_anns, other_anns, date_label)
 
-        fetch_status["message"] = "Saving to database..."
-        save_to_db(all_anns)
-
-        # Store lightweight counts — DO NOT embed announcements in fetch_status.
-        # The frontend fetches them via GET /announcements after status == 'done'.
         fetch_status = {
-            "status":      "done",
-            "message":     f"Done! {len(auth_anns)} auth capital + {len(other_anns)} other announcements.",
-            "progress":    100,
-            "filename":    filename,
-            "auth_count":  len(auth_anns),
-            "other_count": len(other_anns),
-            "total":       len(auth_anns) + len(other_anns),
+            "status":        "done",
+            "message":       f"Done! {len(auth_anns)} auth capital + {len(other_anns)} other announcements.",
+            "progress":      100,
+            "filename":      filename,
+            "auth_count":    len(auth_anns),
+            "other_count":   len(other_anns),
+            "total":         len(all_anns),
+            "announcements": all_anns,
         }
 
     except Exception as e:
-        fetch_status = {"status": "error", "message": str(e), "progress": 0, "filename": ""}
+        import traceback
+        traceback.print_exc()
+        fetch_status = {
+            "status": "error", "message": f"Error: {str(e)}",
+            "progress": 0, "filename": "",
+        }
 
 
 @app.get("/download/{filename}")
@@ -858,16 +901,16 @@ async def download_file(filename: str):
     filepath = os.path.join(OUTPUT_DIR, filename)
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(filepath, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        filename=filename)
+    return FileResponse(
+        filepath,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+    )
 
 
 @app.get("/announcements")
 async def get_announcements():
-    """Return all announcements from the DB for the last fetched date range."""
-    from_date = _last_fetch_range.get("from_date")
-    to_date   = _last_fetch_range.get("to_date")
-    anns = get_from_db(from_date, to_date)
+    anns = fetch_status.get("announcements", [])
     return {"data": anns, "total": len(anns)}
 
 
@@ -875,15 +918,16 @@ async def get_announcements():
 async def health():
     return {"status": "ok", "api_key_set": bool(GROQ_API_KEY)}
 
-# Serve Frontend
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FRONTEND_DIR = os.path.join(os.path.dirname(BASE_DIR), "frontend")
-if not os.path.exists(FRONTEND_DIR):
-    FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 
-@app.get("/")
-async def serve_frontend():
-    index_path = os.path.join(FRONTEND_DIR, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    return {"error": "Frontend not found"}
+# ─── FRONTEND ─────────────────────────────────────────────────────────────────
+
+from fastapi.staticfiles import StaticFiles
+
+frontend_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
+if os.path.exists(frontend_path):
+    @app.get("/")
+    async def serve_frontend():
+        index_path = os.path.join(frontend_path, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+        raise HTTPException(status_code=404, detail="Frontend index.html not found")
