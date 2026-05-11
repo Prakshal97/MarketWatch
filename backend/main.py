@@ -985,23 +985,25 @@ async def run_pipeline(from_date: str, to_date: str):
                 has_existing = bool(existing_cap)
                 has_new = bool(new_cap)
 
-                strict_cap_raise = (
-                    has_existing
-                    and has_new
-                    and normalize_money(existing_cap) != normalize_money(new_cap)
+                # HYBRID VALIDATION (CASE 1: Numeric OR CASE 2: High-Intent Keywords)
+                has_numeric_evidence = bool(existing_cap or new_cap or ann.get("proposed_increase"))
+                
+                has_auth_keywords = any(
+                    kw in pdf_text
+                    for kw in [
+                        "authorised share capital",
+                        "authorized share capital",
+                        "increase in authorised",
+                        "increase in authorized",
+                        "preferential issue",
+                        "preferential allotment",
+                        "warrants",
+                        "capital clause",
+                        "alteration of capital"
+                    ]
                 )
 
-                strict_fundraise = (
-                    "preferential allotment" in pdf_text
-                    or "preferential issue" in pdf_text
-                    or "rights issue" in pdf_text
-                    or "qualified institutions placement" in pdf_text
-                    or "qip" in pdf_text
-                    or "fund raising" in pdf_text
-                    or "issue of warrants" in pdf_text
-                )
-
-                if strict_cap_raise or strict_fundraise:
+                if has_numeric_evidence or has_auth_keywords:
                     validated_auth.append(ann)
                 else:
                     print(f"❌ Removed false positive: {ann.get('company')}")
