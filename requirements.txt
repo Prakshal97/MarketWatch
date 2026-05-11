@@ -6,3 +6,4 @@ groq==0.9.0
 python-dotenv==1.0.1
 pydantic==2.7.1
 pdfplumber
+pypdf==4.2.0

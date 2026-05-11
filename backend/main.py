@@ -45,10 +45,16 @@ OUTPUT_DIR = "./output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 NSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.nseindia.com/",
+    "Origin": "https://www.nseindia.com",
+    "Connection": "keep-alive",
 }
 
 BSE_HEADERS = {
@@ -72,12 +78,19 @@ async def fetch_nse_announcements(from_date: str, to_date: str) -> list:
     announcements = []
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         try:
+            # WARMUP: Get session cookies from homepage first
             await client.get("https://www.nseindia.com", headers=NSE_HEADERS)
+            
             url = (
                 f"https://www.nseindia.com/api/corporate-announcements"
                 f"?index=equities&from_date={from_date}&to_date={to_date}"
             )
             resp = await client.get(url, headers=NSE_HEADERS)
+            
+            print(f"  NSE Status: {resp.status_code}")
+            if resp.status_code != 200:
+                print(f"  NSE Response Snippet: {resp.text[:500]}")
+
             if resp.status_code == 200:
                 data = resp.json()
                 items = data if isinstance(data, list) else data.get("data", [])
@@ -228,6 +241,10 @@ def safe_str(val) -> str:
     return str(val)
 
 
+def normalize_money(val):
+    return re.sub(r"[^\d]", "", str(val or ""))
+
+
 async def fetch_stock_data(symbol: str, exchange: str) -> dict:
     result = {"cmp": "", "mcap": "", "sector": ""}
     if not symbol:
@@ -281,15 +298,23 @@ async def fetch_stock_data(symbol: str, exchange: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 LIGHT_FILTER = [
-    "authorised",
-    "authorized",
-    "share capital",
-    "memorandum",
-    "moa",
-    "board meeting",
-    "egm",
-    "postal ballot",
-    "special resolution",
+    "authorised share capital",
+    "authorized share capital",
+    "increase in authorised",
+    "increase in authorized",
+    "preferential allotment",
+    "preferential issue",
+    "rights issue",
+    "rights offer",
+    "qip",
+    "qualified institutions placement",
+    "fund raising",
+    "fundraising",
+    "issue of warrants",
+    "convertible warrants",
+    "bonus issue",
+    "stock split",
+    "sub-division of shares",
 ]
 
 AUTH_SEARCH_TERMS = [
@@ -297,10 +322,6 @@ AUTH_SEARCH_TERMS = [
     "authorized share capital",
     "increase in authorised share capital",
     "increase in authorized share capital",
-    "alteration of capital clause",
-    "capital clause",
-    "memorandum of association",
-    "amendment to memorandum",
     "preferential issue",
     "preferential allotment",
     "rights issue",
@@ -319,7 +340,10 @@ STRICT_AUTH_TERMS = [
     "existing authorized share capital",
     "authorised share capital of",
     "authorized share capital of",
-    "alteration of capital clause",
+    "increase the authorised share capital",
+    "increase the authorized share capital",
+    "approved increase in authorised share capital",
+    "approved increase in authorized share capital",
     "preferential allotment",
     "preferential issue",
     "rights issue",
@@ -383,7 +407,10 @@ def classify_announcements(announcements: list) -> list:
         ann.setdefault("action", "WATCH")
         ann.setdefault("is_auth_capital", False)
 
-        subj = ann.get("subject", "").lower()
+        subj = (
+            ann.get("subject", "") + " " +
+            ann.get("attchmnt_text", "")
+        ).lower()
         if any(k in subj for k in LIGHT_FILTER):
             candidates.append(ann)
     return candidates
@@ -522,8 +549,8 @@ async def ai_classify_with_pdf(ann: dict, retry_count=0) -> bool:
     
     hard_match = any(term in pdf_lower for term in STRICT_AUTH_TERMS)
 
-    if not hard_match:
-        print(f"❌ HARD FILTER REJECTED: {company}")
+    if not hard_match and pdf_text:
+        print(f"❌ HARD FILTER REJECTED (Text Found but no Match): {company}")
         return False
 
     # FOURTH FIX — BETTER PROMPT
@@ -889,14 +916,17 @@ async def run_pipeline(from_date: str, to_date: str):
                 strict_cap_raise = (
                     has_existing
                     and has_new
-                    and existing_cap != new_cap
+                    and normalize_money(existing_cap) != normalize_money(new_cap)
                 )
 
                 strict_fundraise = (
                     "preferential allotment" in pdf_text
+                    or "preferential issue" in pdf_text
                     or "rights issue" in pdf_text
                     or "qualified institutions placement" in pdf_text
                     or "qip" in pdf_text
+                    or "fund raising" in pdf_text
+                    or "issue of warrants" in pdf_text
                 )
 
                 if strict_cap_raise or strict_fundraise:
