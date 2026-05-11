@@ -540,14 +540,60 @@ async def ai_classify_with_pdf(ann: dict, retry_count=0) -> bool:
     exchange = ann.get("exchange", "NSE")
     url = ann.get("link", "")
 
+    # STAGE 2: REJECT OBVIOUS NOISE EARLY
+    negative_patterns = [
+        "statement of deviation",
+        "utilisation of issue proceeds",
+        "newspaper publication",
+        "analyst meeting",
+        "conference call",
+        "audio recording",
+        "transcript",
+    ]
+    if any(p in subject.lower() for p in negative_patterns):
+        print(f"❌ Subject Rejected Early: {company}")
+        return False
+
+    # STAGE 3: DOWNLOAD PDF
     pdf_text = await download_pdf_text(url, exchange, ann)
     if pdf_text:
         ann["_pdf_text_cache"] = pdf_text
 
-    # CRITICAL FIX — HARD RULE BEFORE AI
+    # STAGE 4: NEGATIVE CONTEXT FILTER (WINDSOR FIX)
     pdf_lower = pdf_text.lower()
-    
-    hard_match = any(term in pdf_lower for term in STRICT_AUTH_TERMS)
+    negative_phrases = [
+        "utilisation of proceeds",
+        "utilization of proceeds",
+        "statement of deviation",
+        "deviation or variation",
+        "regulation 32",
+        "previous issue",
+        "already issued",
+        "monitoring agency report",
+    ]
+    if any(p in pdf_lower for p in negative_phrases):
+        print(f"❌ NEGATIVE CONTEXT REJECTED: {company}")
+        return False
+
+    # STAGE 5: CONTEXTUAL REGEX MATCHING
+    hard_match = False
+    context_patterns = [
+        r"increase.{0,80}authori[sz]ed share capital",
+        r"authori[sz]ed share capital.{0,80}increase",
+        r"approved.{0,80}rights issue",
+        r"approved.{0,80}preferential allotment",
+        r"approved.{0,80}preferential issue",
+        r"board.{0,80}approved.{0,80}qip",
+        r"issue of warrants",
+        r"fund raising",
+        r"raising of funds",
+    ]
+
+    for pattern in context_patterns:
+        if re.search(pattern, pdf_lower, re.IGNORECASE | re.DOTALL):
+            hard_match = True
+            print(f"✅ Context Match: {pattern} for {company}")
+            break
 
     if not hard_match and pdf_text:
         print(f"❌ HARD FILTER REJECTED (Text Found but no Match): {company}")
@@ -782,6 +828,9 @@ fetch_status = {
     "filename": "",
 }
 
+LAST_FETCH_TIME = 0
+NSE_CACHE = []  # Fallback cache for NSE results
+
 
 @app.get("/status")
 async def get_status():
@@ -790,8 +839,21 @@ async def get_status():
 
 @app.post("/fetch")
 async def trigger_fetch(req: FetchRequest, background_tasks: BackgroundTasks):
+    global LAST_FETCH_TIME
+    import time
+    
     if fetch_status["status"] == "running":
         raise HTTPException(status_code=409, detail="Fetch already in progress")
+        
+    current_time = time.time()
+    if current_time - LAST_FETCH_TIME < 60:
+        return {
+            "message": "Cooldown active. Please wait a minute before fetching again.",
+            "status": "cooldown",
+            "seconds_left": int(60 - (current_time - LAST_FETCH_TIME))
+        }
+        
+    LAST_FETCH_TIME = current_time
     today = date.today().strftime("%d-%m-%Y")
     from_date = req.from_date or today
     to_date   = req.to_date   or today
@@ -811,6 +873,16 @@ async def run_pipeline(from_date: str, to_date: str):
         }
 
         nse_anns = await fetch_nse_announcements(from_date, to_date)
+        
+        # CACHE FALLBACK LOGIC
+        global NSE_CACHE
+        if nse_anns:
+            NSE_CACHE = nse_anns
+            print(f"  NSE: {len(nse_anns)} found. Cache updated.")
+        elif NSE_CACHE:
+            print("  ⚠️ NSE Fetch failed or empty. Using fallback cache.")
+            nse_anns = NSE_CACHE
+        
         fetch_status = {
             **fetch_status,
             "message": f"NSE: {len(nse_anns)} found. Fetching BSE...",

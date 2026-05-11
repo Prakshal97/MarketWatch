@@ -540,6 +540,7 @@
 
   // — Fetch trigger ——————————————————————————————————————————————————————————————————
   async function triggerFetch() {
+    const btn = document.getElementById('btn-fetch');
     const fromDate = document.getElementById('from-date').value;
     const toDate   = document.getElementById('to-date').value;
     if (!fromDate || !toDate) { alert('Please select both dates'); return; }
@@ -547,18 +548,19 @@
     const apiKey = prompt("Enter Admin API Key to fetch announcements:");
     if (!apiKey) return;
 
-    // Convert YYYY-MM-DD -> DD-MM-YYYY
-    const fmt = d => d.split('-').reverse().join('-');
-
-    document.getElementById('btn-fetch').disabled = true;
+    // DISABLE IMMEDIATELY
+    btn.disabled = true;
     document.getElementById('btn-download').disabled = true;
     document.getElementById('progress-wrap').classList.add('visible');
     document.getElementById('table-container').innerHTML = '';
     allData = [];
     updateStats(0, 0, 0, 0, 0);
 
+    // Convert YYYY-MM-DD -> DD-MM-YYYY
+    const fmt = d => d.split('-').reverse().join('-');
+
     try {
-      await fetch(`${API}/fetch`, {
+      const resp = await fetch(`${API}/fetch`, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -566,10 +568,19 @@
         },
         body: JSON.stringify({ from_date: fmt(fromDate), to_date: fmt(toDate) })
       });
+      
+      const data = await resp.json();
+      if (data.status === 'cooldown') {
+        alert(data.message);
+        btn.disabled = false;
+        document.getElementById('progress-wrap').classList.remove('visible');
+        return;
+      }
+      
       pollStatus();
     } catch (e) {
       alert('Cannot connect to backend. Make sure it is running on port 8000.');
-      document.getElementById('btn-fetch').disabled = false;
+      btn.disabled = false;
     }
   }
 
